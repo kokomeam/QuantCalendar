@@ -48,17 +48,59 @@ const MAX_PREVIEW_EVENTS = 2; // Number of events to show in calendar cell previ
 const PA_NEWS_API_BASE = 'https://universal-api.panewslab.com/calendar/events';
 const PA_NEWS_BATCH_SIZE = 100; // API pagination size
 
+// --- Live Bitcoin Price Fetch (CoinGecko) ---
+type BitcoinPriceData = {
+  priceUsd: number;
+  change24hPct: number;
+  source: "CoinGecko";
+  fetchedAt: string; // ISO string
+};
+
+/**
+ * Fetches live Bitcoin price from CoinGecko API
+ * Returns null on failure (silent error handling)
+ */
+const fetchLiveBitcoinPrice = async (): Promise<BitcoinPriceData | null> => {
+  try {
+    const response = await fetch(
+      'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true'
+    );
+    
+    if (!response.ok) {
+      console.warn('CoinGecko API error:', response.status);
+      return null;
+    }
+    
+    const data = await response.json();
+    
+    if (!data.bitcoin || typeof data.bitcoin.usd !== 'number') {
+      console.warn('Invalid CoinGecko response format');
+      return null;
+    }
+    
+    return {
+      priceUsd: data.bitcoin.usd,
+      change24hPct: data.bitcoin.usd_24h_change || 0,
+      source: "CoinGecko",
+      fetchedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    // Silent error handling - don't block analysis if price fetch fails
+    console.warn('Failed to fetch Bitcoin price:', error);
+    return null;
+  }
+};
+
 // --- Firebase Configuration ---
-// SECURITY NOTE: In production, these values should come from environment variables
-// For now, they are hardcoded but should be moved to .env file
-// Example: import.meta.env.VITE_FIREBASE_API_KEY
+// Note: Firebase API keys are safe to expose in client-side code, but using env vars is best practice
+// These values can be set in a .env file (which is gitignored) or use the defaults below
 const firebaseConfig = {
-  apiKey: "AIzaSyBGeQPvG9i8g_6Tu7J1iMZoDVz8HhLfCv8",
-  authDomain: "quantcalendar-56e73.firebaseapp.com",
-  projectId: "quantcalendar-56e73",
-  storageBucket: "quantcalendar-56e73.firebasestorage.app",
-  messagingSenderId: "918558213412",
-  appId: "1:918558213412:web:d2a8e1885fb5ceeb005fb1"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyBGeQPvG9i8g_6Tu7J1iMZoDVz8HhLfCv8",
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "quantcalendar-56e73.firebaseapp.com",
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "quantcalendar-56e73",
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "quantcalendar-56e73.firebasestorage.app",
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "918558213412",
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:918558213412:web:d2a8e1885fb5ceeb005fb1"
 };
 
 // Initialize Firebase
@@ -1034,6 +1076,8 @@ export default function CryptoCalendar() {
   const [crossAnalysisTab, setCrossAnalysisTab] = useState<'analysis' | 'chat'>('analysis');
   const [chatQuery, setChatQuery] = useState('');
   const [isCrossAnalysisCollapsed, setIsCrossAnalysisCollapsed] = useState(false);
+  const [uploadedImage, setUploadedImage] = useState<File | null>(null); // Screenshot/image for Chat tab
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null); // Object URL for preview
   
   // Data State
   const [markets, setMarkets] = useState<MarketData[]>([]);
@@ -1106,6 +1150,15 @@ export default function CryptoCalendar() {
       analysesUnsub();
     };
   }, [user]);
+
+  // Cleanup image preview URL on unmount or when image changes
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl) {
+        URL.revokeObjectURL(imagePreviewUrl);
+      }
+    };
+  }, [imagePreviewUrl]);
 
   // --- Actions ---
 
@@ -1501,8 +1554,14 @@ export default function CryptoCalendar() {
   };
 
   const clearSelection = () => {
+    // Clean up image object URL if present
+    if (imagePreviewUrl) {
+      URL.revokeObjectURL(imagePreviewUrl);
+    }
     setSelectedDays(new Set());
     setCrossAnalysisResult(null);
+    setUploadedImage(null);
+    setImagePreviewUrl(null);
   };
 
   const runCrossAnalysis = async () => {
@@ -1563,9 +1622,36 @@ export default function CryptoCalendar() {
         return dayData.markets.length > 0 || dayData.manualEvents.length > 0 || dayData.panewsEvents.length > 0;
       });
 
+      // Fetch live Bitcoin price (non-blocking - returns null on failure)
+      const bitcoinPrice = await fetchLiveBitcoinPrice();
+
+      // Convert uploaded image to base64 if present (only for Chat tab)
+      let imageBase64: string | undefined = undefined;
+      if (uploadedImage && crossAnalysisTab === 'chat') {
+        try {
+          imageBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              if (typeof reader.result === 'string') {
+                resolve(reader.result);
+              } else {
+                reject(new Error('Failed to read image as base64'));
+              }
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(uploadedImage);
+          });
+        } catch (error) {
+          console.warn('Failed to convert image to base64:', error);
+          // Continue without image if conversion fails
+        }
+      }
+
       const payload = {
         dates: filteredDates,
-        eventsByDate
+        eventsByDate,
+        liveMarketData: bitcoinPrice ? { bitcoin: bitcoinPrice } : undefined,
+        imageContext: imageBase64
       };
 
       // Call cross analysis function with mode and optional userQuery
@@ -1583,7 +1669,12 @@ export default function CryptoCalendar() {
 
   // Cross Analysis AI function (aggregates data and calls AI)
   const analyzeCrossDays = async (
-    payload: { dates: string[], eventsByDate: Record<string, { markets: MarketData[], manualEvents: string[], panewsEvents: PANewsEvent[] }> },
+    payload: { 
+      dates: string[], 
+      eventsByDate: Record<string, { markets: MarketData[], manualEvents: string[], panewsEvents: PANewsEvent[] }>,
+      liveMarketData?: { bitcoin: BitcoinPriceData },
+      imageContext?: string // base64 image data
+    },
     apiKey: string,
     mode: 'analysis' | 'chat' = 'analysis',
     userQuery?: string
@@ -1640,9 +1731,20 @@ Assume the user understands markets.
 If uncertainty exists, explain WHY.
 If one event dominates, say so explicitly.`;
 
+      // Build context with optional Bitcoin price data
+      let contextText = eventsList;
+      if (payload.liveMarketData?.bitcoin) {
+        const btc = payload.liveMarketData.bitcoin;
+        contextText = `Live Market Context:
+Bitcoin Price: $${btc.priceUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${btc.change24hPct >= 0 ? '+' : ''}${btc.change24hPct.toFixed(2)}% 24h)
+Source: ${btc.source} (fetched at ${new Date(btc.fetchedAt).toLocaleString()})
+
+${eventsList}`;
+      }
+
       userMessage = `Context:
 
-${eventsList}
+${contextText}
 
 User Question:
 
@@ -1704,14 +1806,39 @@ Additional rules:
 - Do not ask follow-up questions
 - Be assertive but reasoned`;
 
+      // Build context with optional Bitcoin price data
+      let contextText = eventsList;
+      if (payload.liveMarketData?.bitcoin) {
+        const btc = payload.liveMarketData.bitcoin;
+        contextText = `Live Market Context:
+Bitcoin Price: $${btc.priceUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${btc.change24hPct >= 0 ? '+' : ''}${btc.change24hPct.toFixed(2)}% 24h)
+Source: ${btc.source} (fetched at ${new Date(btc.fetchedAt).toLocaleString()})
+
+${eventsList}`;
+      }
+
       userMessage = `Analyze the following events across the selected dates:
 
-${eventsList}
+${contextText}
 
 Provide your analysis following the required format.`;
     }
 
     try {
+      // Build user message content - support multimodal (text + image) if image is present
+      let userContent: string | Array<{ type: "text" | "image_url", text?: string, image_url?: { url: string } }>;
+      
+      if (payload.imageContext) {
+        // Multimodal: text + image
+        userContent = [
+          { type: "text", text: userMessage },
+          { type: "image_url", image_url: { url: payload.imageContext } }
+        ];
+      } else {
+        // Text-only: existing format
+        userContent = userMessage;
+      }
+
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -1719,10 +1846,10 @@ Provide your analysis following the required format.`;
           'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-          model: "gpt-4-turbo", 
+          model: payload.imageContext ? "gpt-4o" : "gpt-4-turbo", // Use gpt-4o for multimodal, gpt-4-turbo for text-only
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user", content: userMessage }
+            { role: "user", content: userContent }
           ],
           temperature: 0.7
         })
@@ -2392,15 +2519,76 @@ Provide your analysis following the required format.`;
 
             {/* Chat Input (only in Chat tab) */}
             {crossAnalysisTab === 'chat' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">Your Question</label>
-                <textarea
-                  value={chatQuery}
-                  onChange={(e) => setChatQuery(e.target.value)}
-                  placeholder="What if CPI surprises higher?&#10;Which event dominates across these days?&#10;An ETF approval just happened — how does it affect later events?"
-                  className="w-full h-24 border border-slate-300 rounded-lg px-3 py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none bg-white text-slate-700 placeholder:text-slate-400"
-                  rows={4}
-                />
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">Your Question</label>
+                  <textarea
+                    value={chatQuery}
+                    onChange={(e) => setChatQuery(e.target.value)}
+                    placeholder="What if CPI surprises higher?&#10;Which event dominates across these days?&#10;An ETF approval just happened — how does it affect later events?"
+                    className="w-full h-24 border border-slate-300 rounded-lg px-3 py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none bg-white text-slate-700 placeholder:text-slate-400"
+                    rows={4}
+                  />
+                </div>
+                
+                {/* Screenshot/Image Upload (optional) */}
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">
+                    Screenshot/Image (Optional)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        // Clean up previous preview URL
+                        if (imagePreviewUrl) {
+                          URL.revokeObjectURL(imagePreviewUrl);
+                        }
+                        if (file) {
+                          setUploadedImage(file);
+                          setImagePreviewUrl(URL.createObjectURL(file));
+                        } else {
+                          setUploadedImage(null);
+                          setImagePreviewUrl(null);
+                        }
+                      }}
+                      className="hidden"
+                      id="image-upload-input"
+                    />
+                    <label
+                      htmlFor="image-upload-input"
+                      className="flex-1 cursor-pointer border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-600 hover:bg-slate-50 transition-colors"
+                    >
+                      {uploadedImage ? uploadedImage.name : "Choose image file..."}
+                    </label>
+                    {uploadedImage && (
+                      <button
+                        onClick={() => {
+                          if (imagePreviewUrl) {
+                            URL.revokeObjectURL(imagePreviewUrl);
+                          }
+                          setUploadedImage(null);
+                          setImagePreviewUrl(null);
+                        }}
+                        className="text-slate-400 hover:text-slate-700 px-2 py-1 text-xs"
+                        title="Remove image"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  {imagePreviewUrl && (
+                    <div className="mt-2">
+                      <img
+                        src={imagePreviewUrl}
+                        alt="Preview"
+                        className="max-w-full max-h-32 rounded border border-slate-200"
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
