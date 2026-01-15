@@ -27,18 +27,36 @@ export function normalizeGammaEvent(
 ): NormalizedMarket[] {
   const normalized: NormalizedMarket[] = [];
 
-  // Extract event title
-  const eventTitle = event.title || '';
-  if (!eventTitle) {
-    console.warn('Event missing title, skipping:', event.id || 'unknown');
-    return normalized;
-  }
-
+  // Extract event title - use fallback if missing
+  let eventTitle = event.title || '';
+  
   // Normalize tags
   const tagsString = tagsToString(event.tags || []);
 
   // Process markets
-  const markets = event.markets || [];
+  let markets = event.markets || [];
+  
+  // Handle case where Gamma API returns markets directly (not nested under events)
+  // Check if the event itself is actually a market
+  if (markets.length === 0 && (event as any).question) {
+    // This is a market, not an event - wrap it in an array
+    markets = [event as any as GammaMarket];
+    // Use market question as event title if event title is missing
+    if (!eventTitle) {
+      eventTitle = (event as any).question || 'Unknown Event';
+    }
+  }
+  
+  // If still no title after checking markets, use first market's question as fallback
+  if (!eventTitle && markets.length > 0 && markets[0].question) {
+    eventTitle = markets[0].question;
+  }
+  
+  // If we still have no title and no markets, skip this event
+  if (!eventTitle && markets.length === 0) {
+    console.warn('Event missing title and markets, skipping:', event.id || 'unknown');
+    return normalized;
+  }
   
   // Filter and sort markets
   const validMarkets = markets
@@ -79,8 +97,11 @@ export function normalizeGammaEvent(
   for (const market of validMarkets) {
     const yesPrice = Number(market.yesPrice) || 0;
     
+    // Use market question as catalyst name fallback if event title is still missing
+    const catalystName = eventTitle || market.question || 'Unknown Event';
+    
     normalized.push({
-      Catalyst_Name: eventTitle,
+      Catalyst_Name: catalystName,
       Question: market.question || '',
       Price: yesPrice.toFixed(2),
       Volume: market.volume || 0,
