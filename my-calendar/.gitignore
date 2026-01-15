@@ -18,6 +18,7 @@ dist-ssr
 !package.json
 !package-lock.json
 !tsconfig*.json
+!railway.json
 
 # Editor directories and files
 .vscode/*
