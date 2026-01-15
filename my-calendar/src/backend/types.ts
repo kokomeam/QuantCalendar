@@ -23,6 +23,7 @@ export type GammaMarket = {
 };
 
 export type NormalizedMarket = {
+  marketId: string; // Gamma API market ID for matching
   Catalyst_Name: string;
   Question: string;
   Price: string; // yesPrice.toFixed(2)

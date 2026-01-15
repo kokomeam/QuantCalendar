@@ -27,36 +27,19 @@ export function normalizeGammaEvent(
 ): NormalizedMarket[] {
   const normalized: NormalizedMarket[] = [];
 
-  // Extract event title - use fallback if missing
-  let eventTitle = event.title || '';
+  // Extract event title (required per original requirements)
+  const eventTitle = event.title || '';
+  if (!eventTitle) {
+    // Per original requirements: extract event.title
+    // If missing, skip event (don't use fallbacks to match n8n behavior)
+    return normalized;
+  }
   
   // Normalize tags
   const tagsString = tagsToString(event.tags || []);
 
   // Process markets
-  let markets = event.markets || [];
-  
-  // Handle case where Gamma API returns markets directly (not nested under events)
-  // Check if the event itself is actually a market
-  if (markets.length === 0 && (event as any).question) {
-    // This is a market, not an event - wrap it in an array
-    markets = [event as any as GammaMarket];
-    // Use market question as event title if event title is missing
-    if (!eventTitle) {
-      eventTitle = (event as any).question || 'Unknown Event';
-    }
-  }
-  
-  // If still no title after checking markets, use first market's question as fallback
-  if (!eventTitle && markets.length > 0 && markets[0].question) {
-    eventTitle = markets[0].question;
-  }
-  
-  // If we still have no title and no markets, skip this event
-  if (!eventTitle && markets.length === 0) {
-    console.warn('Event missing title and markets, skipping:', event.id || 'unknown');
-    return normalized;
-  }
+  const markets = event.markets || [];
   
   // Filter and sort markets
   const validMarkets = markets
@@ -96,12 +79,16 @@ export function normalizeGammaEvent(
   // Flatten to normalized format
   for (const market of validMarkets) {
     const yesPrice = Number(market.yesPrice) || 0;
+    const marketId = market.id || '';
     
-    // Use market question as catalyst name fallback if event title is still missing
-    const catalystName = eventTitle || market.question || 'Unknown Event';
+    if (!marketId) {
+      console.warn('Market missing ID, skipping:', market.question?.substring(0, 50));
+      continue;
+    }
     
     normalized.push({
-      Catalyst_Name: catalystName,
+      marketId: marketId,
+      Catalyst_Name: eventTitle,
       Question: market.question || '',
       Price: yesPrice.toFixed(2),
       Volume: market.volume || 0,

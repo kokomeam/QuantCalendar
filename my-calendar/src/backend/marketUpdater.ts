@@ -23,16 +23,14 @@ function getServiceAccount(): admin.ServiceAccount {
   // Check environment variable first (for deployed environments)
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     try {
-      console.log('[DIAG] Loading service account from FIREBASE_SERVICE_ACCOUNT environment variable');
       return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) as admin.ServiceAccount;
     } catch (error) {
-      console.error('[DIAG] Failed to parse FIREBASE_SERVICE_ACCOUNT:', error);
+      console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT:', error);
       throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT environment variable');
     }
   }
   
   // Fallback to file (for local development)
-  console.log(`[DIAG] Loading service account from file: ${serviceAccountPath}`);
   const serviceAccountContent = readFileSync(serviceAccountPath, 'utf8');
   return JSON.parse(serviceAccountContent) as admin.ServiceAccount;
 }
@@ -45,43 +43,25 @@ function getFirestore(): admin.firestore.Firestore {
   }
   
   try {
-    // DIAGNOSTIC: Verify Admin SDK initialization
-    console.log('[DIAG] Checking Firebase Admin SDK initialization...');
-    console.log('[DIAG] admin.apps:', admin.apps ? admin.apps.length : 'undefined');
-    
     const apps = admin.apps || [];
     if (apps.length === 0) {
       const serviceAccount = getServiceAccount();
-      // Service account JSON uses snake_case, but we need to access it correctly
       const projectId = (serviceAccount as any).project_id || (serviceAccount as any).projectId;
-      const clientEmail = (serviceAccount as any).client_email || (serviceAccount as any).clientEmail;
-      console.log(`[DIAG] Service account loaded, project_id: ${projectId}`);
-      console.log(`[DIAG] Service account type: ${(serviceAccount as any).type || 'service_account'}`);
-      console.log(`[DIAG] Service account client_email: ${clientEmail}`);
       
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         projectId: projectId
       });
-      console.log('[DIAG] ✅ Firebase Admin SDK initialized');
-      console.log('[DIAG] admin.apps.length after init:', admin.apps.length);
-      console.log('[DIAG] Initialized app projectId:', admin.app().options.projectId);
-    } else {
-      console.log(`[DIAG] Firebase Admin already initialized (${apps.length} app(s))`);
     }
     
     // Get Firestore instance
     db = admin.firestore();
-    console.log('[DIAG] Firestore instance created');
-    console.log('[DIAG] Firestore projectId:', (db as any).projectId || 'not available');
     
-    // Note: settings() must be called before any operations, but preferRest may not be available in all versions
+    // Use REST API for better network compatibility
     try {
       (db.settings as any)({ preferRest: true });
-      console.log('[DIAG] ✅ Firestore Admin initialized (REST API preferred)');
     } catch (settingsError) {
-      console.log('[DIAG] ✅ Firestore Admin initialized (default settings)');
-      console.log('[DIAG] Settings error (non-fatal):', settingsError instanceof Error ? settingsError.message : String(settingsError));
+      // Ignore if settings not available
     }
     return db;
   } catch (error) {
@@ -126,19 +106,15 @@ async function fetchGammaMarkets(): Promise<GammaEvent[]> {
 
     const data = await response.json();
     
-    // Log raw response once for verification (only first time)
+    // Log raw response structure once for verification
     if (!(globalThis as any).__gamma_logged) {
       console.log('=== GAMMA API RAW RESPONSE (first call) ===');
       console.log('Response type:', Array.isArray(data) ? 'array' : typeof data);
-      if (Array.isArray(data)) {
+      if (Array.isArray(data) && data.length > 0) {
         console.log('Array length:', data.length);
-        if (data.length > 0) {
-          console.log('First item keys:', Object.keys(data[0]));
-          console.log('First item sample:', JSON.stringify(data[0], null, 2).substring(0, 1000));
-        }
-      } else {
+        console.log('First item keys:', Object.keys(data[0]));
+      } else if (typeof data === 'object' && data !== null) {
         console.log('Response keys:', Object.keys(data));
-        console.log('Response sample:', JSON.stringify(data, null, 2).substring(0, 1000));
       }
       (globalThis as any).__gamma_logged = true;
     }
@@ -168,75 +144,30 @@ async function getExistingMarketIds(): Promise<Set<string>> {
   
   try {
     const firestore = getFirestore();
+    const marketsRef = firestore
+      .collection('artifacts')
+      .doc(appId)
+      .collection('public')
+      .doc('data')
+      .collection('markets');
     
-    // DIAGNOSTIC: Log exact path being queried
-    console.log(`[DIAG] Querying Firestore path: artifacts/${appId}/public/data/markets`);
-    console.log(`[DIAG] appId: ${appId}`);
-    
-    // Build the reference step by step for diagnostics
-    const artifactsRef = firestore.collection('artifacts');
-    console.log(`[DIAG] artifacts collection reference created`);
-    
-    const appDocRef = artifactsRef.doc(appId);
-    console.log(`[DIAG] app document reference: artifacts/${appId}`);
-    
-    const publicRef = appDocRef.collection('public');
-    console.log(`[DIAG] public collection reference: artifacts/${appId}/public`);
-    
-    const dataDocRef = publicRef.doc('data');
-    console.log(`[DIAG] data document reference: artifacts/${appId}/public/data`);
-    
-    const marketsRef = dataDocRef.collection('markets');
-    console.log(`[DIAG] markets collection reference: artifacts/${appId}/public/data/markets`);
-    
-    // CRITICAL FIX: Add .limit() to prevent query timeout on large collections
-    // Without limit, Firestore may timeout trying to fetch all documents
     const snapshot = await marketsRef.limit(1000).get();
-    
-    // DIAGNOSTIC: Log snapshot results
-    console.log(`[DIAG] Snapshot retrieved successfully`);
-    console.log(`[DIAG] Snapshot size: ${snapshot.size}`);
-    console.log(`[DIAG] Snapshot empty: ${snapshot.empty}`);
-    console.log(`[DIAG] Snapshot docs length: ${snapshot.docs.length}`);
     
     snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const data = doc.data() as MarketData;
-      // Extract market ID - could be stored in various fields
-      // Check common ID fields from Gamma API
       if (data.id) {
         marketIds.add(data.id);
       }
-      // Also check if there's a gammaMarketId field
       if ((data as any).gammaMarketId) {
         marketIds.add((data as any).gammaMarketId);
       }
     });
     
-    console.log(`[DIAG] Found ${marketIds.size} existing markets in Firestore`);
-    if (marketIds.size === 0) {
-      console.warn(`[DIAG] No markets found. Possible reasons:`);
-      console.warn(`  - Firestore path: artifacts/${appId}/public/data/markets`);
-      console.warn(`  - Documents exist but don't have 'id' or 'gammaMarketId' fields`);
-      console.warn(`  - Collection is empty`);
-      // Log first document if any exist (for debugging)
-      if (snapshot.size > 0) {
-        const firstDoc = snapshot.docs[0];
-        const firstData = firstDoc.data();
-        console.warn(`[DIAG] First doc ID: ${firstDoc.id}`);
-        console.warn(`[DIAG] First doc data keys:`, Object.keys(firstData));
-        console.warn(`[DIAG] First doc has 'id' field:`, 'id' in firstData);
-        console.warn(`[DIAG] First doc 'id' value:`, firstData.id);
-      }
-    }
-    
+    console.log(`Found ${marketIds.size} existing markets in Firestore`);
     return marketIds;
   } catch (error) {
-    console.error('[DIAG] Error fetching existing market IDs:', error);
-    if (error instanceof Error) {
-      console.error('[DIAG] Error message:', error.message);
-      console.error('[DIAG] Error stack:', error.stack);
-    }
-    return marketIds; // Return empty set on error
+    console.error('Error fetching existing market IDs:', error);
+    return marketIds;
   }
 }
 
@@ -245,7 +176,7 @@ async function getExistingMarketIds(): Promise<Set<string>> {
  */
 async function updateMarket(
   marketId: string,
-  normalized: { Catalyst_Name: string; Question: string; Price: string; Volume: number | string; EndDate: string; Tags: string },
+  normalized: { marketId: string; Catalyst_Name: string; Question: string; Price: string; Volume: number | string; EndDate: string; Tags: string },
   existingMarket: MarketData
 ): Promise<boolean> {
   try {
@@ -303,7 +234,6 @@ export async function updateMarkets(): Promise<{
 
   try {
     console.log('Starting market update...');
-    console.log(`[DEBUG] updateMarkets called. Firestore db state: ${db !== null ? 'initialized' : 'not initialized'}`);
     
     // Cleanup old shocks
     cleanupOldShocks();
@@ -340,34 +270,23 @@ export async function updateMarkets(): Promise<{
     
     console.log(`Fetched ${gammaEvents.length} events from Gamma API`);
     
-    // Create a map of existing markets by question/title for matching
-    const marketsByQuestion = new Map<string, MarketData>();
-    existingMarkets.forEach(market => {
-      const key = (market.question || market.title || '').toLowerCase().trim();
-      if (key) {
-        marketsByQuestion.set(key, market);
-      }
-    });
-    
-    // Process Gamma events and match to existing markets
+    // Process Gamma events and match to existing markets by ID
     for (const gammaEvent of gammaEvents) {
       try {
-        // Normalize event
+        // Normalize event - this already filters by existingMarketIds
         const normalizedMarkets = normalizeGammaEvent(gammaEvent, existingMarketIds);
         
         if (normalizedMarkets.length === 0) {
           continue; // Event filtered out
         }
         
-        // Try to match each normalized market to an existing Firestore market
+        // Process each normalized market - match by ID
         for (const normalizedMarket of normalizedMarkets) {
-          // Match by question (case-insensitive)
-          const questionKey = normalizedMarket.Question.toLowerCase().trim();
-          const existingMarket = marketsByQuestion.get(questionKey);
+          // Match by market ID (already filtered by normalizeGammaEvent)
+          const existingMarket = existingMarkets.get(normalizedMarket.marketId);
           
           if (!existingMarket) {
-            // Market doesn't exist in Firestore, skip (only update existing)
-            continue;
+            continue; // Market not found (shouldn't happen, but skip if it does)
           }
           
           // Update market
