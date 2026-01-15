@@ -15,6 +15,7 @@ import {
   deleteDoc,
   writeBatch
 } from 'firebase/firestore';
+import { classifyBTCImpact } from './services/btcImpactService';
 import { 
   Calendar as CalendarIcon, 
   ChevronLeft, 
@@ -44,7 +45,7 @@ import {
 // --- Constants ---
 const SIGNIFICANT_CHANGE_THRESHOLD = 0.05; // 5% change threshold
 const MAX_BATCH_SIZE = 490; // Firestore batch limit is 500, using 490 for safety
-const MAX_PREVIEW_EVENTS = 2; // Number of events to show in calendar cell preview
+const MAX_PREVIEW_EVENTS = 4; // Number of events to show in calendar cell preview
 const PA_NEWS_API_BASE = 'https://universal-api.panewslab.com/calendar/events';
 const PA_NEWS_BATCH_SIZE = 100; // API pagination size
 
@@ -112,14 +113,25 @@ const appId = 'production-calendar';
 // --- Filter Tag Groups ---
 const FILTER_TAG_GROUPS = {
   bitcoin: ['bitcoin', 'federal_reserve', 'interest_rates', 'economy', 'inflation', 'macro', 'politics', 'election', 'war', 'geopolitics'],
-  economy: ['federal_reserve', 'interest_rates', 'economy', 'inflation', 'gdp', 'employment', 'macro'],
-  politics: ['politics', 'election', 'war', 'geopolitics', 'government', 'regulation', 'sanctions']
+  economy: [
+    'federal_reserve', 'interest_rates', 'economy', 'inflation', 'gdp', 'employment', 'macro',
+    'unemployment', 'jobs', 'cpi', 'ppi', 'retail_sales', 'consumer_spending', 'trade',
+    'deficit', 'debt', 'monetary_policy', 'fiscal_policy', 'central_bank', 'ecb', 'boj',
+    'fed', 'fomc', 'economic_data', 'economic_indicator', 'recession', 'growth', 'productivity'
+  ],
+  politics: [
+    'politics', 'election', 'war', 'geopolitics', 'government', 'regulation', 'sanctions',
+    'congress', 'senate', 'house', 'white_house', 'president', 'administration', 'policy',
+    'legislation', 'bill', 'law', 'trade_war', 'tariffs', 'diplomacy', 'treaty', 'alliance',
+    'military', 'defense', 'security', 'foreign_policy', 'domestic_policy', 'executive_order',
+    'supreme_court', 'judiciary', 'voting', 'campaign', 'candidate', 'party', 'democrat', 'republican'
+  ]
 } as const;
 
 type FilterType = keyof typeof FILTER_TAG_GROUPS;
 
 // --- Types ---
-type MarketData = {
+export type MarketData = {
   id: string;
   title: string;
   resolveDate: string; // YYYY-MM-DD
@@ -133,6 +145,9 @@ type MarketData = {
   question?: string;
   volume?: string | number;
   tags?: string[]; // Array of tags parsed from pipe-delimited string
+  // BTC Impact classification
+  btcImpact?: 'bullish' | 'bearish' | 'neutral';
+  btcImpactUpdatedAt?: string; // ISO string
   // Allow additional properties from Firebase (for forward compatibility)
   [key: string]: unknown;
 };
@@ -890,15 +905,16 @@ const DayCell = ({
     }
   }
 
-  // Filter prediction markets: show only one per catalyst (highest volume)
-  // This is presentation-layer filtering for calendar cells only
-  const filteredMarkets = data?.markets ? selectTopVolumeMarketPerCatalyst(data.markets) : [];
+  // For calendar preview: show ALL prediction markets (don't filter by catalyst)
+  // This prioritizes showing all markets in the preview, not just one per catalyst
+  // The detail modal still shows all markets
+  const allMarkets = data?.markets || [];
   
   // For calendar preview: when filters are active, filter out non-matching events
   // For expanded view: show all events (handled separately in the modal)
   const previewMarkets = hasActiveFilters && eventMatchesFilters
-    ? filteredMarkets.filter(m => eventMatchesFilters(m.tags))
-    : filteredMarkets;
+    ? allMarkets.filter(m => eventMatchesFilters(m.tags))
+    : allMarkets;
   
   // Manual events have no tags, so when filters are active, hide them in preview
   // (They're still shown in the detail modal)
@@ -1007,19 +1023,31 @@ const DayCell = ({
         )}
 
         <div className="flex flex-col gap-0.5 sm:gap-1 flex-1 min-h-0 overflow-hidden">
-          {/* Calendar Preview: When filters active, only show matching events (no greying) */}
-          {previewMarkets.slice(0, MAX_PREVIEW_EVENTS).map((m) => (
-            <div 
-              key={m.id} 
-              className="flex items-center gap-0.5 sm:gap-1 text-[9px] sm:text-[10px] bg-slate-100/80 px-1 sm:px-1.5 py-0.5 rounded border border-slate-200 truncate text-slate-700 flex-shrink-0"
-            >
-              <span className={`font-bold flex-shrink-0 ${m.changeDelta && Math.abs(m.changeDelta) > SIGNIFICANT_CHANGE_THRESHOLD ? 'text-amber-600' : 'text-blue-600'}`}>
-                  {(m.probability * 100).toFixed(0)}%
-              </span>
-              <span className="truncate min-w-0">{m.title}</span>
-            </div>
-          ))}
-          {previewManualEvents.map((e, idx) => (
+          {/* Calendar Preview: Prioritize prediction markets, show other events only if space allows */}
+          {/* Show all prediction markets first (up to MAX_PREVIEW_EVENTS) */}
+          {previewMarkets.slice(0, MAX_PREVIEW_EVENTS).map((m) => {
+            // Apply BTC impact background color
+            const bgColorClass = m.btcImpact === 'bullish' 
+              ? 'bg-emerald-100/80 border-emerald-200' 
+              : m.btcImpact === 'bearish' 
+              ? 'bg-rose-100/80 border-rose-200' 
+              : 'bg-slate-100/80 border-slate-200';
+            
+            return (
+              <div 
+                key={m.id} 
+                className={`flex items-center gap-0.5 sm:gap-1 text-[9px] sm:text-[10px] ${bgColorClass} px-1 sm:px-1.5 py-0.5 rounded border truncate text-slate-700 flex-shrink-0`}
+              >
+                <span className={`font-bold flex-shrink-0 ${m.changeDelta && Math.abs(m.changeDelta) > SIGNIFICANT_CHANGE_THRESHOLD ? 'text-amber-600' : 'text-blue-600'}`}>
+                    {(m.probability * 100).toFixed(0)}%
+                </span>
+                <span className="truncate min-w-0">{m.title}</span>
+              </div>
+            );
+          })}
+          
+          {/* Only show manual events if we haven't reached MAX_PREVIEW_EVENTS with markets */}
+          {previewMarkets.length < MAX_PREVIEW_EVENTS && previewManualEvents.slice(0, MAX_PREVIEW_EVENTS - previewMarkets.length).map((e, idx) => (
             <div 
               key={idx} 
               className="flex items-center gap-0.5 sm:gap-1 text-[9px] sm:text-[10px] bg-amber-50 px-1 sm:px-1.5 py-0.5 rounded border border-amber-100 truncate text-amber-800 flex-shrink-0"
@@ -1027,8 +1055,9 @@ const DayCell = ({
                <span className="truncate min-w-0">📢 {e}</span>
             </div>
           ))}
-          {/* PA News Events Preview */}
-          {previewPANews.slice(0, MAX_PREVIEW_EVENTS).map((e) => (
+          
+          {/* Only show PA News events if we still have space after markets and manual events */}
+          {previewMarkets.length + previewManualEvents.length < MAX_PREVIEW_EVENTS && previewPANews.slice(0, MAX_PREVIEW_EVENTS - previewMarkets.length - previewManualEvents.length).map((e) => (
             <div 
               key={e.id} 
               className="flex items-center gap-0.5 sm:gap-1 text-[9px] sm:text-[10px] bg-blue-50 px-1 sm:px-1.5 py-0.5 rounded border border-blue-100 truncate text-blue-800 flex-shrink-0"
@@ -1083,11 +1112,16 @@ export default function CryptoCalendar() {
   const [markets, setMarkets] = useState<MarketData[]>([]);
   const [manualEvents, setManualEvents] = useState<Record<string, string[]>>({}); 
   const [panewsEvents, setPANewsEvents] = useState<Record<string, PANewsEvent[]>>({});
-  const [analyses, setAnalyses] = useState<Record<string, AnalysisResult>>({}); 
+  const [analyses, setAnalyses] = useState<Record<string, AnalysisResult>>({});
+  const [lastMarketUpdate, setLastMarketUpdate] = useState<number | null>(null); 
   
   // Settings State
   const [openAIKey, setOpenAIKey] = useState('');
   const [jsonInput, setJsonInput] = useState('');
+  
+  // BTC Impact Classification State
+  const [isClassifyingBTCImpact, setIsClassifyingBTCImpact] = useState(false);
+  const [btcImpactProgress, setBtcImpactProgress] = useState({ current: 0, total: 0 });
   const [isAnalysing, setIsAnalysing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [importStatus, setImportStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
@@ -1111,8 +1145,24 @@ export default function CryptoCalendar() {
     // Load Data Collections
     const marketsUnsub = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'markets'), (snap) => {
       const loadedMarkets: MarketData[] = [];
-      snap.forEach(doc => loadedMarkets.push(doc.data() as MarketData));
+      let maxLastUpdated = 0;
+      snap.forEach(doc => {
+        const data = doc.data() as MarketData;
+        loadedMarkets.push(data);
+        // Track the most recent lastUpdated timestamp
+        if (data.lastUpdated && data.lastUpdated > maxLastUpdated) {
+          maxLastUpdated = data.lastUpdated;
+        }
+      });
       setMarkets(loadedMarkets);
+      if (maxLastUpdated > 0) {
+        setLastMarketUpdate(maxLastUpdated);
+        console.log('Market update timestamp:', new Date(maxLastUpdated).toLocaleString());
+      } else if (loadedMarkets.length > 0) {
+        // Fallback: use current time if no lastUpdated found (for markets without timestamp)
+        console.warn('Markets found but no lastUpdated timestamps. Using current time.');
+        setLastMarketUpdate(Date.now());
+      }
     }, (err) => console.error("Market fetch error", err));
 
     const eventsUnsub = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'manual_events'), (snap) => {
@@ -1884,15 +1934,20 @@ Provide your analysis following the required format.`;
   /**
    * Check if an event matches any of the active filters
    * Manual events (no tags) never match filters
+   * Comparison is case-insensitive to handle tag variations
    */
   const eventMatchesFilters = (tags: string[] | undefined): boolean => {
     if (activeFilters.size === 0) return true; // No filters = show all
     if (!tags || tags.length === 0) return false; // Manual events don't match
     
-    // Check if any tag intersects with any active filter's tag group
+    // Normalize tags to lowercase for comparison (tags are already lowercase from normalization, but be safe)
+    const normalizedTags = tags.map(t => String(t).toLowerCase().trim()).filter(t => t.length > 0);
+    
+    // Check if any tag intersects with any active filter's tag group (case-insensitive exact match)
     for (const filterType of activeFilters) {
       const filterTags = FILTER_TAG_GROUPS[filterType];
-      const hasMatch = tags.some(tag => (filterTags as readonly string[]).includes(tag));
+      const normalizedFilterTags = (filterTags as readonly string[]).map(ft => ft.toLowerCase());
+      const hasMatch = normalizedTags.some(tag => normalizedFilterTags.includes(tag));
       if (hasMatch) return true;
     }
     
@@ -2002,6 +2057,38 @@ Provide your analysis following the required format.`;
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showFilters]);
 
+  // Format time ago helper
+  const formatTimeAgo = (timestamp: number): string => {
+    const now = Date.now();
+    const diff = now - timestamp;
+    const seconds = Math.floor(diff / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    
+    if (seconds < 60) return 'just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  };
+
+  // Update time ago display every 10 seconds
+  const [timeAgoDisplay, setTimeAgoDisplay] = useState<string>('');
+  useEffect(() => {
+    if (!lastMarketUpdate) {
+      setTimeAgoDisplay('');
+      return;
+    }
+    
+    const updateDisplay = () => {
+      setTimeAgoDisplay(formatTimeAgo(lastMarketUpdate));
+    };
+    
+    updateDisplay(); // Initial update
+    const interval = setInterval(updateDisplay, 10000); // Update every 10 seconds
+    return () => clearInterval(interval);
+  }, [lastMarketUpdate]);
+
   return (
     <div className="min-h-screen w-full bg-slate-50 text-slate-900 font-sans">
       
@@ -2013,7 +2100,14 @@ Provide your analysis following the required format.`;
           </div>
           <div>
             <h1 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Market Intelligence</h1>
-            <p className="text-[10px] sm:text-xs text-slate-500 font-medium">Crypto Prediction Calendar</p>
+            <div className="flex items-center gap-2">
+              <p className="text-[10px] sm:text-xs text-slate-500 font-medium">Crypto Prediction Calendar</p>
+              {timeAgoDisplay && (
+                <span className="text-[11px] sm:text-xs text-slate-600 font-medium">
+                  • Updated {timeAgoDisplay}
+                </span>
+              )}
+            </div>
           </div>
         </div>
         
@@ -2102,6 +2196,56 @@ Provide your analysis following the required format.`;
           >
             <GitBranch size={16} className="sm:w-4 sm:h-4" />
             <span className="hidden sm:inline">Cross Analysis</span>
+          </button>
+          <button 
+            onClick={async () => {
+              if (!openAIKey) {
+                alert("Please enter your OpenAI API Key in settings first.");
+                return;
+              }
+              if (isClassifyingBTCImpact) return;
+              
+              setIsClassifyingBTCImpact(true);
+              setBtcImpactProgress({ current: 0, total: 0 });
+              
+              try {
+                const result = await classifyBTCImpact(db, appId, openAIKey, {
+                  force: true, // Force regeneration to reclassify all events
+                  onProgress: (current, total) => {
+                    setBtcImpactProgress({ current, total });
+                  }
+                });
+                
+                alert(`BTC Impact classification complete!\n\nClassified: ${result.classified}\nSkipped: ${result.skipped}\nErrors: ${result.errors}${result.errorsList.length > 0 ? `\n\nErrors:\n${result.errorsList.slice(0, 5).join('\n')}${result.errorsList.length > 5 ? `\n... and ${result.errorsList.length - 5} more` : ''}` : ''}`);
+              } catch (error) {
+                console.error('BTC Impact classification failed:', error);
+                alert('BTC Impact classification failed. Check console for details.');
+              } finally {
+                setIsClassifyingBTCImpact(false);
+                setBtcImpactProgress({ current: 0, total: 0 });
+              }
+            }}
+            disabled={isClassifyingBTCImpact}
+            aria-label="Regenerate BTC Impact"
+            className={`p-1.5 sm:p-2 rounded-lg transition-colors flex items-center gap-1.5 sm:gap-2 text-xs sm:text-sm font-medium relative z-[60] ${
+              isClassifyingBTCImpact
+                ? 'bg-blue-600 text-white cursor-wait'
+                : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            {isClassifyingBTCImpact ? (
+              <>
+                <Loader2 size={16} className="sm:w-4 sm:h-4 animate-spin" />
+                <span className="hidden sm:inline">
+                  {btcImpactProgress.total > 0 ? `${btcImpactProgress.current}/${btcImpactProgress.total}` : 'Classifying...'}
+                </span>
+              </>
+            ) : (
+              <>
+                <Activity size={16} className="sm:w-4 sm:h-4" />
+                <span className="hidden sm:inline">Regenerate BTC Impact</span>
+              </>
+            )}
           </button>
           <button 
             onClick={() => setShowSettings(true)}
@@ -2217,10 +2361,17 @@ Provide your analysis following the required format.`;
                         // Otherwise fall back to title (for markets without question field)
                         const displayText = m.question || m.title;
                         
+                        // Apply BTC impact background color
+                        const bgColorClass = m.btcImpact === 'bullish' 
+                          ? 'bg-emerald-50 border-emerald-100' 
+                          : m.btcImpact === 'bearish' 
+                          ? 'bg-rose-50 border-rose-100' 
+                          : 'bg-slate-50 border-slate-100';
+                        
                         return (
                             <div 
                               key={m.id} 
-                              className={`flex items-center justify-between p-2 sm:p-3 bg-slate-50 border border-slate-100 rounded-lg group hover:border-blue-200 transition-colors gap-2 ${
+                              className={`flex items-center justify-between p-2 sm:p-3 ${bgColorClass} rounded-lg group hover:border-blue-200 transition-colors gap-2 ${
                                 !matches ? 'opacity-40 grayscale' : ''
                               }`}
                             >
