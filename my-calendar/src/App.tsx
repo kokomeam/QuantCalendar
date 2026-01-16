@@ -954,7 +954,7 @@ const DayCell = ({
       // Prevent text selection during drag
       e.preventDefault();
       if (onMouseDown) {
-        onMouseDown();
+      onMouseDown();
       }
     }
   };
@@ -1045,15 +1045,15 @@ const DayCell = ({
               : 'bg-slate-100/80 border-slate-200';
             
             return (
-              <div 
-                key={m.id} 
+            <div 
+              key={m.id} 
                 className={`flex items-center gap-0.5 sm:gap-1 text-[9px] sm:text-[10px] ${bgColorClass} px-1 sm:px-1.5 py-0.5 rounded border truncate text-slate-700 flex-shrink-0`}
-              >
-                <span className={`font-bold flex-shrink-0 ${m.changeDelta && Math.abs(m.changeDelta) > SIGNIFICANT_CHANGE_THRESHOLD ? 'text-amber-600' : 'text-blue-600'}`}>
-                    {(m.probability * 100).toFixed(0)}%
-                </span>
-                <span className="truncate min-w-0">{m.title}</span>
-              </div>
+            >
+              <span className={`font-bold flex-shrink-0 ${m.changeDelta && Math.abs(m.changeDelta) > SIGNIFICANT_CHANGE_THRESHOLD ? 'text-amber-600' : 'text-blue-600'}`}>
+                  {(m.probability * 100).toFixed(0)}%
+              </span>
+              <span className="truncate min-w-0">{m.title}</span>
+            </div>
             );
           })}
           
@@ -1123,7 +1123,7 @@ export default function CryptoCalendar() {
   const [markets, setMarkets] = useState<MarketData[]>([]);
   const [manualEvents, setManualEvents] = useState<Record<string, string[]>>({}); 
   const [panewsEvents, setPANewsEvents] = useState<Record<string, PANewsEvent[]>>({});
-  const [analyses, setAnalyses] = useState<Record<string, AnalysisResult>>({});
+  const [analyses, setAnalyses] = useState<Record<string, AnalysisResult>>({}); 
   const [lastMarketUpdate, setLastMarketUpdate] = useState<number | null>(null); 
   
   // Settings State
@@ -1250,17 +1250,30 @@ export default function CryptoCalendar() {
       let skipped = 0;
       let firstValidDate: Date | null = null;
       let updateCount = 0;
+      let insertCount = 0; // Track new inserts separately
 
       parsed.forEach((item: Record<string, unknown>) => {
           if (count >= MAX_BATCH_SIZE) return; 
 
           const normalized = normalizeMarketData(item);
           if (normalized && normalized.id && normalized.resolveDate) {
-              const marketRef = doc(db, 'artifacts', appId, 'public', 'data', 'markets', normalized.id);
-              
               // === SMART CHANGE DETECTION ===
               // Lookup existing data from our local state (avoiding extra read costs)
-              const existingMarket = markets.find(m => m.id === normalized.id);
+              // Match by MarketID first (stable identifier), then by document ID
+              const marketIdFromImport = (normalized as any).MarketID || (normalized as any).marketId;
+              let existingMarket = marketIdFromImport 
+                ? markets.find(m => (m as any).MarketID === marketIdFromImport || m.marketId === marketIdFromImport)
+                : null;
+              
+              // Fallback to ID matching if MarketID match failed
+              if (!existingMarket) {
+                existingMarket = markets.find(m => m.id === normalized.id);
+              }
+              
+              // CRITICAL: Use existing document ID if market was found, otherwise use normalized ID
+              // This prevents creating duplicate documents when ID format changes
+              const documentId = existingMarket ? existingMarket.id : normalized.id;
+              const marketRef = doc(db, 'artifacts', appId, 'public', 'data', 'markets', documentId);
               
               const newProbability = normalized.probability || 0;
               let previousProbability = existingMarket?.probability;
@@ -1281,16 +1294,24 @@ export default function CryptoCalendar() {
                        // We can choose NOT to update timestamp if value didn't change
                        // but for "Update Analysis" logic, we might want to know when we last confirmed the data
                   }
+              } else {
+                  // This is a new market (not found in existing markets)
+                  insertCount++;
               }
 
               // Apply the smart fields
+              // CRITICAL: Preserve existing document ID to prevent duplicates
+              // If market exists, use its existing ID; otherwise use normalized ID
               const finalData = {
                   ...normalized,
+                  id: documentId, // Override with correct document ID (existing or new)
                   lastUpdated,
                   previousProbability: previousProbability !== undefined ? previousProbability : null,
                   changeDelta: Number(changeDelta.toFixed(4)) // Clean float
               };
 
+              // Use merge: true to upsert (update if exists, insert if new)
+              // This ensures existing markets are updated, not duplicated
               batch.set(marketRef, finalData, { merge: true });
               count++;
               
@@ -1308,9 +1329,9 @@ export default function CryptoCalendar() {
       
       if (firstValidDate) {
           setCurrentDate(firstValidDate as Date);
-          alert(`Import Successful!\n\nImported/Updated ${count} items.\nDetected Changes in ${updateCount} items.\nSkipped ${skipped}.\n\nJumping calendar to: ${toLocalISOString(firstValidDate as Date)}`);
+          alert(`Import Successful!\n\nTotal processed: ${count} items\n- New: ${insertCount} items\n- Updated: ${updateCount} items (with probability changes)\n- Unchanged: ${count - insertCount - updateCount} items\n- Skipped: ${skipped}\n\nJumping calendar to: ${toLocalISOString(firstValidDate as Date)}`);
       } else {
-          alert(`Import Successful.\nImported: ${count}, Skipped: ${skipped}`);
+          alert(`Import Successful.\nTotal: ${count}, New: ${insertCount}, Updated: ${updateCount}, Skipped: ${skipped}`);
       }
 
       setTimeout(() => setImportStatus('idle'), 3000);
@@ -2112,7 +2133,7 @@ Provide your analysis following the required format.`;
           <div>
             <h1 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Market Intelligence</h1>
             <div className="flex items-center gap-2">
-              <p className="text-[10px] sm:text-xs text-slate-500 font-medium">Crypto Prediction Calendar</p>
+            <p className="text-[10px] sm:text-xs text-slate-500 font-medium">Crypto Prediction Calendar</p>
               {timeAgoDisplay && (
                 <span className="text-[11px] sm:text-xs text-slate-600 font-medium">
                   • Updated {timeAgoDisplay}
@@ -2566,15 +2587,15 @@ Provide your analysis following the required format.`;
             </div>
           ) : (
             // Expanded Panel View
-            <div className="fixed bottom-4 right-4 bg-white rounded-xl shadow-2xl border border-slate-200 z-[55] max-w-md w-full sm:w-96 max-h-[80vh] overflow-y-auto flex flex-col">
-              <div className="p-4 bg-gradient-to-r from-blue-50 to-indigo-50 border-b border-slate-200 flex justify-between items-center">
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-                    <GitBranch size={16} className="text-blue-600" />
-                    Cross Analysis
-                  </h3>
-                  <p className="text-xs text-slate-600 mt-1 font-medium">{selectedDays.size} day{selectedDays.size !== 1 ? 's' : ''} selected</p>
-                </div>
+        <div className="fixed bottom-4 right-4 bg-white rounded-xl shadow-2xl border border-slate-200 z-[55] max-w-md w-full sm:w-96 max-h-[80vh] overflow-y-auto flex flex-col">
+          <div className="p-4 bg-gradient-to-r from-blue-50 to-indigo-50 border-b border-slate-200 flex justify-between items-center">
+            <div>
+              <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                <GitBranch size={16} className="text-blue-600" />
+                Cross Analysis
+              </h3>
+              <p className="text-xs text-slate-600 mt-1 font-medium">{selectedDays.size} day{selectedDays.size !== 1 ? 's' : ''} selected</p>
+            </div>
                 <div className="flex items-center gap-1">
                   <button 
                     onClick={() => setIsCrossAnalysisCollapsed(true)}
@@ -2583,15 +2604,15 @@ Provide your analysis following the required format.`;
                   >
                     <ChevronDown size={18} />
                   </button>
-                  <button 
-                    onClick={toggleCrossAnalysisMode}
-                    className="text-slate-400 hover:text-slate-700 hover:bg-white/50 rounded-lg p-1 transition-colors"
+            <button 
+              onClick={toggleCrossAnalysisMode}
+              className="text-slate-400 hover:text-slate-700 hover:bg-white/50 rounded-lg p-1 transition-colors"
                     title="Close cross analysis"
-                  >
-                    <X size={18} />
-                  </button>
+            >
+              <X size={18} />
+            </button>
                 </div>
-              </div>
+          </div>
 
           {/* Tab Switcher */}
           <div className="px-4 pt-4 pb-3 border-b border-slate-200 bg-white">
@@ -2682,15 +2703,15 @@ Provide your analysis following the required format.`;
             {/* Chat Input (only in Chat tab) */}
             {crossAnalysisTab === 'chat' && (
               <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">Your Question</label>
-                  <textarea
-                    value={chatQuery}
-                    onChange={(e) => setChatQuery(e.target.value)}
-                    placeholder="What if CPI surprises higher?&#10;Which event dominates across these days?&#10;An ETF approval just happened — how does it affect later events?"
-                    className="w-full h-24 border border-slate-300 rounded-lg px-3 py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none bg-white text-slate-700 placeholder:text-slate-400"
-                    rows={4}
-                  />
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">Your Question</label>
+                <textarea
+                  value={chatQuery}
+                  onChange={(e) => setChatQuery(e.target.value)}
+                  placeholder="What if CPI surprises higher?&#10;Which event dominates across these days?&#10;An ETF approval just happened — how does it affect later events?"
+                  className="w-full h-24 border border-slate-300 rounded-lg px-3 py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none bg-white text-slate-700 placeholder:text-slate-400"
+                  rows={4}
+                />
                 </div>
                 
                 {/* Screenshot/Image Upload (optional) */}
@@ -2827,7 +2848,7 @@ Provide your analysis following the required format.`;
               </div>
             )}
           </div>
-            </div>
+        </div>
           )}
         </>
       )}

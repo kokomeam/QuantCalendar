@@ -3,7 +3,7 @@
  * MUST match the exact n8n cleaning logic
  */
 
-import type { GammaEvent, GammaMarket, NormalizedMarket } from './types';
+import type { GammaEvent, NormalizedMarket } from './types';
 
 /**
  * Normalize tags array to pipe-delimited string

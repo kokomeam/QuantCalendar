@@ -90,6 +90,68 @@ function tagsToString(tags: Array<{ slug?: string; label?: string }> = []): stri
 }
 
 /**
+ * Check if a market's end date has already passed
+ * Handles multiple date formats: YYYY-MM-DD, ISO strings, timestamps
+ */
+function isMarketResolved(endDate: string | undefined | null, resolveDate: string | undefined | null): boolean {
+  if (!endDate && !resolveDate) {
+    return false; // No date info, assume not resolved
+  }
+  
+  const dateStr = endDate || resolveDate;
+  if (!dateStr) {
+    return false;
+  }
+  
+  try {
+    let date: Date;
+    
+    // Handle ISO string format (e.g., "2026-01-31T00:00:00Z")
+    if (typeof dateStr === 'string' && dateStr.includes('T')) {
+      date = new Date(dateStr);
+    }
+    // Handle YYYY-MM-DD format
+    else if (typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      const parts = dateStr.split('-');
+      date = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    }
+    // Handle timestamp (number or string number)
+    else if (typeof dateStr === 'number' || (typeof dateStr === 'string' && /^\d+$/.test(dateStr))) {
+      date = new Date(Number(dateStr));
+    }
+    // Try parsing as-is
+    else {
+      date = new Date(dateStr);
+    }
+    
+    // Check if date is valid
+    if (isNaN(date.getTime())) {
+      console.warn(`Invalid date format: ${dateStr}`);
+      return false; // Invalid date, assume not resolved to be safe
+    }
+    
+    // Compare with current date/time
+    const now = new Date();
+    
+    // For YYYY-MM-DD format, compare dates only (ignore time)
+    // Market is resolved if end date is before today (yesterday or earlier)
+    if (typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const endDateOnly = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+      // If end date is before today, market is resolved
+      return endDateOnly < today;
+    }
+    
+    // For ISO strings with time, compare exact timestamps
+    // Market is resolved if end date/time has passed
+    return date < now;
+  } catch (error) {
+    console.warn(`Error parsing date ${dateStr}:`, error);
+    return false; // On error, assume not resolved to be safe
+  }
+}
+
+/**
  * Fetch a single market by ID from Gamma API
  * Tries /markets/{id} endpoint
  */
@@ -407,6 +469,7 @@ export async function updateMarkets(): Promise<{
     // CRITICAL: Only process markets that exist in Firestore - never create new ones
     let processedCount = 0;
     let skippedCount = 0;
+    let resolvedCount = 0; // Track markets skipped due to being resolved
     
     for (const marketId of existingMarketIds) {
       const existingMarket = existingMarketsByMarketId.get(marketId);
@@ -425,10 +488,27 @@ export async function updateMarkets(): Promise<{
         continue;
       }
       
+      // CRITICAL: Check if market's end date has already passed - skip if resolved
+      const endDate = existingMarket.resolveDate || (existingMarket as any).endDate || (existingMarket as any).EndDate;
+      if (isMarketResolved(endDate, existingMarket.resolveDate)) {
+        // Market has already resolved, skip updating
+        resolvedCount++;
+        skippedCount++;
+        continue;
+      }
+      
       const gammaMarket = marketsById.get(marketId);
       
       if (!gammaMarket) {
         // Market not found in Gamma API - this is OK, just skip updating it
+        skippedCount++;
+        continue;
+      }
+      
+      // CRITICAL: Check if market is closed or resolved in Gamma API
+      if (gammaMarket.closed || gammaMarket.resolved) {
+        // Market is closed/resolved in Gamma API, skip updating
+        resolvedCount++;
         skippedCount++;
         continue;
       }
@@ -520,7 +600,7 @@ export async function updateMarkets(): Promise<{
     }
     
     console.log(`Market update complete: ${result.updated} updated, ${result.errors} errors, ${result.shocks} shocks`);
-    console.log(`Processed ${processedCount} markets, skipped ${skippedCount} (not in Gamma API or missing data)`);
+    console.log(`Processed ${processedCount} markets, skipped ${skippedCount} total (${resolvedCount} resolved/closed, ${skippedCount - resolvedCount} not in Gamma API or missing data)`);
     
     return result;
   } catch (error) {
