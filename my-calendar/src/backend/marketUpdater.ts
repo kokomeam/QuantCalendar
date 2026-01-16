@@ -109,6 +109,17 @@ async function fetchMarketById(marketId: string): Promise<GammaMarket | null> {
     }
 
     const data = await response.json();
+    
+    // Log first market structure for debugging
+    if (!(globalThis as any).__market_by_id_logged) {
+      console.log('=== GAMMA API MARKET BY ID STRUCTURE (first call) ===');
+      console.log('Market ID:', marketId);
+      console.log('Response type:', typeof data);
+      console.log('Response keys:', Object.keys(data));
+      console.log('Response sample:', JSON.stringify(data, null, 2).substring(0, 1500));
+      (globalThis as any).__market_by_id_logged = true;
+    }
+    
     return data as GammaMarket;
   } catch (error) {
     console.error(`Error fetching market ${marketId}:`, error);
@@ -347,12 +358,24 @@ export async function updateMarkets(): Promise<{
       const marketId = data.marketId || (data as any).MarketId;
       if (marketId) {
         existingMarketsByMarketId.set(String(marketId), data);
+      } else {
+        // Log first market without marketId for debugging
+        if (!(globalThis as any).__no_marketid_warned) {
+          console.warn(`Market ${data.id} has no marketId field. Keys:`, Object.keys(data));
+          (globalThis as any).__no_marketid_warned = true;
+        }
       }
       // Also store by document id for updates
       existingMarketsById.set(data.id, data);
     });
     
     console.log(`Processing ${existingMarketsByMarketId.size} markets (by marketId)...`);
+    if (existingMarketsByMarketId.size === 0) {
+      console.warn('⚠️ No markets found with marketId field! Markets may need to be re-imported with MarketId.');
+      if (snapshot.docs.length > 0) {
+        console.warn('Sample market keys:', Object.keys(snapshot.docs[0].data()));
+      }
+    }
     
     // Fetch markets from Gamma API - try by ID first, then fallback to bulk
     console.log('Fetching markets from Gamma API...');
@@ -400,24 +423,45 @@ export async function updateMarkets(): Promise<{
       }
       
       try {
+        // Log market structure for first few markets to debug
+        if (!(globalThis as any).__market_structure_logged) {
+          console.log('=== GAMMA MARKET STRUCTURE (first market) ===');
+          console.log('Market ID:', marketId);
+          console.log('Market keys:', Object.keys(gammaMarket));
+          console.log('Market sample:', JSON.stringify(gammaMarket, null, 2).substring(0, 1000));
+          (globalThis as any).__market_structure_logged = true;
+        }
+        
+        // Try different field names for yesPrice (Gamma API might use different names)
+        const yesPrice = (gammaMarket.yesPrice !== undefined ? gammaMarket.yesPrice :
+                         (gammaMarket as any).yes_price !== undefined ? (gammaMarket as any).yes_price :
+                         (gammaMarket as any).yesPrice !== undefined ? (gammaMarket as any).yesPrice :
+                         (gammaMarket as any).price !== undefined ? (gammaMarket as any).price :
+                         (gammaMarket as any).lastPrice !== undefined ? (gammaMarket as any).lastPrice :
+                         (gammaMarket as any).outcomePrices?.[0] !== undefined ? (gammaMarket as any).outcomePrices[0] :
+                         undefined);
+        
+        // Validate price
+        const yesPriceNum = yesPrice !== undefined ? Number(yesPrice) : NaN;
+        if (isNaN(yesPriceNum) || yesPriceNum < 0 || yesPriceNum > 1) {
+          console.warn(`Invalid yesPrice for market ${marketId}: ${yesPrice} (checked: yesPrice, yes_price, price, lastPrice, outcomePrices[0])`);
+          console.warn(`Market data keys:`, Object.keys(gammaMarket));
+          continue;
+        }
+        
         // Create a normalized market from the Gamma market
         // We need event info - try to get it from the market or use defaults
         const normalized: NormalizedMarket = {
           marketId: marketId,
-          Catalyst_Name: (gammaMarket as any).event?.title || existingMarket.catalyst || 'Unknown Event',
+          Catalyst_Name: (gammaMarket as any).event?.title || (gammaMarket as any).title || existingMarket.catalyst || 'Unknown Event',
           Question: gammaMarket.question || existingMarket.question || '',
-          Price: (Number(gammaMarket.yesPrice) || 0).toFixed(2),
+          Price: yesPriceNum.toFixed(2),
           Volume: gammaMarket.volume || existingMarket.volume || 0,
-          EndDate: gammaMarket.endDate || existingMarket.resolveDate || '',
-          Tags: (gammaMarket as any).event?.tags ? tagsToString((gammaMarket as any).event.tags) : (existingMarket.tags?.join('|') || '')
+          EndDate: gammaMarket.endDate || (gammaMarket as any).end_date || (gammaMarket as any).expirationDate || existingMarket.resolveDate || '',
+          Tags: (gammaMarket as any).event?.tags ? tagsToString((gammaMarket as any).event.tags) : 
+                (gammaMarket as any).tags ? tagsToString((gammaMarket as any).tags) :
+                (existingMarket.tags?.join('|') || '')
         };
-        
-        // Validate price
-        const yesPrice = Number(gammaMarket.yesPrice);
-        if (isNaN(yesPrice) || yesPrice < 0 || yesPrice > 1) {
-          console.warn(`Invalid yesPrice for market ${marketId}: ${gammaMarket.yesPrice}`);
-          continue;
-        }
         
         // Update market
         const updated = await updateMarket(existingMarket.id, normalized, existingMarket);
