@@ -238,12 +238,16 @@ async function getExistingMarketIds(): Promise<Set<string>> {
     
     snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const data = doc.data() as MarketData;
-      if (data.id) {
-        marketIds.add(data.id);
-      }
-      if ((data as any).gammaMarketId) {
+      // Prioritize marketId (Polymarket ID) over id (content-based ID)
+      if (data.marketId) {
+        marketIds.add(data.marketId);
+      } else if ((data as any).MarketId) {
+        // Handle case variations
+        marketIds.add(String((data as any).MarketId));
+      } else if ((data as any).gammaMarketId) {
         marketIds.add((data as any).gammaMarketId);
       }
+      // Note: We don't use data.id because it's content-based, not the Polymarket ID
     });
     
     console.log(`Found ${marketIds.size} existing markets in Firestore`);
@@ -286,7 +290,7 @@ async function updateMarket(
       question: normalized.Question || existingMarket.question,
       volume: normalized.Volume,
       resolveDate: normalized.EndDate || existingMarket.resolveDate,
-      tags: normalized.Tags ? normalized.Tags.split('|') : existingMarket.tags,
+      tags: normalized.Tags ? normalized.Tags.split('|').map(t => t.trim().toLowerCase()).filter(t => t.length > 0) : existingMarket.tags,
       // Track probability change for shock detection
       previousProbability: existingMarket.probability,
       changeDelta: newProbability - previousProbability
@@ -333,14 +337,22 @@ export async function updateMarkets(): Promise<{
     const firestore = getFirestore();
     const marketsRef = firestore.collection('artifacts').doc(appId).collection('public').doc('data').collection('markets');
     const snapshot = await marketsRef.get();
-    const existingMarkets = new Map<string, MarketData>();
+    // Map by marketId (Polymarket ID) for matching, not by content-based id
+    const existingMarketsByMarketId = new Map<string, MarketData>();
+    const existingMarketsById = new Map<string, MarketData>(); // Also keep by id for document updates
     
     snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const data = doc.data() as MarketData;
-      existingMarkets.set(data.id, data);
+      // Use marketId (Polymarket ID) as primary key for matching
+      const marketId = data.marketId || (data as any).MarketId;
+      if (marketId) {
+        existingMarketsByMarketId.set(String(marketId), data);
+      }
+      // Also store by document id for updates
+      existingMarketsById.set(data.id, data);
     });
     
-    console.log(`Processing ${existingMarkets.size} markets...`);
+    console.log(`Processing ${existingMarketsByMarketId.size} markets (by marketId)...`);
     
     // Fetch markets from Gamma API - try by ID first, then fallback to bulk
     console.log('Fetching markets from Gamma API...');
@@ -361,11 +373,10 @@ export async function updateMarkets(): Promise<{
     
     if (matchingIds.length === 0) {
       console.warn('⚠️ No matching market IDs found! This suggests ID format mismatch.');
-      console.warn('Sample Firestore IDs:', Array.from(existingMarketIds).slice(0, 5));
+      console.warn('Sample Firestore marketIds:', Array.from(existingMarketIds).slice(0, 5));
       console.warn('Sample Gamma API IDs:', Array.from(marketIdsInResponse).slice(0, 5));
     }
     
-    // Group markets by event (if they have event info) or process individually
     // Create a map of markets by ID for quick lookup
     const marketsById = new Map<string, GammaMarket>();
     gammaMarkets.forEach(market => {
@@ -374,9 +385,15 @@ export async function updateMarkets(): Promise<{
       }
     });
     
-    // Process each existing market
-    for (const [marketId, existingMarket] of existingMarkets.entries()) {
+    // Process each existing market by marketId (Polymarket ID)
+    for (const marketId of existingMarketIds) {
+      const existingMarket = existingMarketsByMarketId.get(marketId);
       const gammaMarket = marketsById.get(marketId);
+      
+      if (!existingMarket) {
+        console.warn(`Market with marketId ${marketId} not found in existingMarkets map`);
+        continue;
+      }
       
       if (!gammaMarket) {
         continue; // Market not found in Gamma API response

@@ -145,6 +145,7 @@ export type MarketData = {
   question?: string;
   volume?: string | number;
   tags?: string[]; // Array of tags parsed from pipe-delimited string
+  marketId?: string; // Polymarket market ID for backend updates
   // BTC Impact classification
   btcImpact?: 'bullish' | 'bearish' | 'neutral';
   btcImpactUpdatedAt?: string; // ISO string
@@ -284,15 +285,19 @@ const normalizeMarketData = (item: Record<string, unknown>): Partial<MarketData>
     }
   }
   
-  // 5. ID Generation (CONTENT BASED) - Ignore numeric ID from n8n
-  // We clean the title to be safe for ID usage
-  const cleanTitle = String(title).replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50);
-  const id = `n8n-${cleanTitle}-${resolveDate}`;
-
   if (!resolveDate) return null; // Skip if no valid date found
 
-  // 6. Preserve prediction market specific fields if they exist
-  const catalyst = getValue(['catalyst', 'Catalyst']);
+  // 5. Extract Polymarket MarketId (for backend updates)
+  const marketId = getValue(['MarketId', 'marketId', 'MarketID', 'market_id', 'id']);
+  const marketIdStr = marketId !== undefined && marketId !== null ? String(marketId) : undefined;
+
+  // 6. ID Generation (CONTENT BASED) - Use MarketId if available, otherwise generate
+  // We clean the title to be safe for ID usage
+  const cleanTitle = String(title).replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50);
+  const id = marketIdStr ? `market-${marketIdStr}` : `n8n-${cleanTitle}-${resolveDate}`;
+
+  // 7. Preserve prediction market specific fields if they exist
+  const catalyst = getValue(['catalyst', 'Catalyst', 'Catalyst_Name']);
   const question = getValue(['question', 'Question']);
   const volume = getValue(['volume', 'Volume']);
   const tagsValue = getValue(['tags', 'Tags', 'tag', 'Tag']);
@@ -304,6 +309,11 @@ const normalizeMarketData = (item: Record<string, unknown>): Partial<MarketData>
     probability: probVal,
     source: 'n8n'
   };
+
+  // Store MarketId for backend matching
+  if (marketIdStr) {
+    (result as any).marketId = marketIdStr;
+  }
 
   // Preserve prediction market fields if present
   if (catalyst !== undefined && catalyst !== null) {
