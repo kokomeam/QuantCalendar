@@ -212,7 +212,11 @@ async function fetchGammaMarkets(marketIds?: Set<string>): Promise<GammaMarket[]
         if (market) {
           markets.push(market);
         } else {
-          console.warn(`Market ${batch[idx]} not found in Gamma API`);
+          // Market not found - this is OK, it may have been closed/removed from Polymarket
+          // Only log at debug level to reduce noise
+          if (process.env.DEBUG === 'true') {
+            console.log(`[DEBUG] Market ${batch[idx]} not found in Gamma API (may be closed/removed)`);
+          }
         }
       });
       
@@ -223,7 +227,10 @@ async function fetchGammaMarkets(marketIds?: Set<string>): Promise<GammaMarket[]
     }
     
     if (markets.length > 0) {
-      console.log(`Successfully fetched ${markets.length} markets by ID`);
+      const foundCount = markets.length;
+      const totalRequested = marketIds ? marketIds.size : 0;
+      const notFoundCount = totalRequested - foundCount;
+      console.log(`Successfully fetched ${foundCount}/${totalRequested} markets from Gamma API${notFoundCount > 0 ? ` (${notFoundCount} not found - may be closed/removed)` : ''}`);
       return markets;
     }
     
@@ -293,38 +300,91 @@ async function fetchGammaMarkets(marketIds?: Set<string>): Promise<GammaMarket[]
 }
 
 /**
- * Get all existing market IDs from Firestore
+ * Get all existing markets from Firestore (optimized - single read)
+ * Returns both the market IDs set and the full market data map
  */
-async function getExistingMarketIds(): Promise<Set<string>> {
+async function getExistingMarkets(): Promise<{
+  marketIds: Set<string>;
+  marketsByMarketId: Map<string, MarketData>;
+  marketsById: Map<string, MarketData>;
+}> {
   const marketIds = new Set<string>();
+  const marketsByMarketId = new Map<string, MarketData>();
+  const marketsById = new Map<string, MarketData>();
   
-  try {
-    const firestore = getFirestore();
-    const marketsRef = firestore
-      .collection('artifacts')
-      .doc(appId)
-      .collection('public')
-      .doc('data')
-      .collection('markets');
-    
-    const snapshot = await marketsRef.limit(1000).get();
-    
-    snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
-      const data = doc.data() as MarketData;
-      // Prioritize MarketID (capital, from n8n import) then marketId (camelCase)
-      const marketId = (data as any).MarketID || data.marketId || (data as any).MarketId || (data as any).gammaMarketId;
-      if (marketId) {
-        marketIds.add(String(marketId));
+  // Retry logic for quota errors
+  const maxRetries = 3;
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const firestore = getFirestore();
+      const marketsRef = firestore
+        .collection('artifacts')
+        .doc(appId)
+        .collection('public')
+        .doc('data')
+        .collection('markets');
+      
+      // Use select() to only fetch MarketID/marketId fields to reduce read costs
+      // However, we need full data for updates, so we'll fetch all but optimize elsewhere
+      const snapshot = await marketsRef.limit(1000).get();
+      
+      snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+        const data = doc.data() as MarketData;
+        // CRITICAL: Prioritize MarketID (capital, from n8n import) then marketId (camelCase)
+        // DO NOT use data.id - that's the Firestore document ID (content-based), not the Polymarket MarketID
+        const marketId = (data as any).MarketID || data.marketId || (data as any).MarketId || (data as any).gammaMarketId;
+        if (marketId) {
+          const marketIdStr = String(marketId);
+          marketIds.add(marketIdStr);
+          marketsByMarketId.set(marketIdStr, data);
+        } else {
+          // Log first few markets without MarketID for debugging
+          if (!(globalThis as any).__no_marketid_in_getids) {
+            console.warn(`[WARN] Market document ${doc.id} has no MarketID/marketId field. Document ID: ${data.id}. Available keys:`, Object.keys(data));
+            (globalThis as any).__no_marketid_in_getids = true;
+          }
+        }
+        // Also store by document id for updates
+        marketsById.set(data.id, data);
+        // Note: We intentionally don't use data.id for marketIds because it's content-based (e.g., "n8n-..." or "market-..."), 
+        // not the actual Polymarket MarketID that Gamma API expects
+      });
+      
+      console.log(`Found ${marketIds.size} existing markets in Firestore (by MarketID/marketId)`);
+      
+      // Log sample of IDs being used for debugging
+      if (marketIds.size > 0 && !(globalThis as any).__market_ids_logged) {
+        const sampleIds = Array.from(marketIds).slice(0, 5);
+        console.log(`[DEBUG] Sample MarketIDs from Firestore:`, sampleIds);
+        (globalThis as any).__market_ids_logged = true;
       }
-      // Note: We don't use data.id because it's content-based, not the Polymarket ID
-    });
-    
-    console.log(`Found ${marketIds.size} existing markets in Firestore`);
-    return marketIds;
-  } catch (error) {
-    console.error('Error fetching existing market IDs:', error);
-    return marketIds;
+      
+      return { marketIds, marketsByMarketId, marketsById };
+    } catch (error: any) {
+      lastError = error;
+      const isQuotaError = error?.code === 8 || // RESOURCE_EXHAUSTED
+                         error?.message?.includes('Quota exceeded') ||
+                         error?.message?.includes('RESOURCE_EXHAUSTED');
+      
+      if (isQuotaError && attempt < maxRetries - 1) {
+        // Exponential backoff for quota errors: 30s, 60s, 120s
+        const backoffMs = 30000 * Math.pow(2, attempt);
+        console.warn(`[WARN] Firestore quota exceeded (attempt ${attempt + 1}/${maxRetries}). Retrying in ${backoffMs / 1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+        continue;
+      }
+      
+      // If not a quota error or final attempt, throw
+      console.error('Error fetching existing markets:', error);
+      break;
+    }
   }
+  
+  // If all retries failed, return empty sets
+  console.error('Failed to fetch markets after retries:', lastError);
+  return { marketIds, marketsByMarketId, marketsById };
 }
 
 /**
@@ -393,44 +453,20 @@ export async function updateMarkets(): Promise<{
     // Cleanup old shocks
     cleanupOldShocks();
     
-    // Get existing market IDs
-    const existingMarketIds = await getExistingMarketIds();
+    // OPTIMIZATION: Get existing markets in a single read (reduces Firestore quota usage by 50%)
+    const { marketIds: existingMarketIds, marketsByMarketId: existingMarketsByMarketId, marketsById: existingMarketsById } = await getExistingMarkets();
     
     if (existingMarketIds.size === 0) {
       console.log('No existing markets found, skipping update');
       return result;
     }
     
-    // Fetch all existing markets to get their data
-    const firestore = getFirestore();
-    const marketsRef = firestore.collection('artifacts').doc(appId).collection('public').doc('data').collection('markets');
-    const snapshot = await marketsRef.get();
-    // Map by marketId (Polymarket ID) for matching, not by content-based id
-    const existingMarketsByMarketId = new Map<string, MarketData>();
-    const existingMarketsById = new Map<string, MarketData>(); // Also keep by id for document updates
-    
-    snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
-      const data = doc.data() as MarketData;
-      // Use MarketID (capital, from n8n) or marketId (camelCase) as primary key for matching
-      const marketId = (data as any).MarketID || data.marketId || (data as any).MarketId;
-      if (marketId) {
-        existingMarketsByMarketId.set(String(marketId), data);
-      } else {
-        // Log first market without marketId for debugging
-        if (!(globalThis as any).__no_marketid_warned) {
-          console.warn(`Market ${data.id} has no MarketID/marketId field. Keys:`, Object.keys(data));
-          (globalThis as any).__no_marketid_warned = true;
-        }
-      }
-      // Also store by document id for updates
-      existingMarketsById.set(data.id, data);
-    });
-    
     console.log(`Processing ${existingMarketsByMarketId.size} markets (by marketId)...`);
     if (existingMarketsByMarketId.size === 0) {
       console.warn('⚠️ No markets found with marketId field! Markets may need to be re-imported with MarketId.');
-      if (snapshot.docs.length > 0) {
-        console.warn('Sample market keys:', Object.keys(snapshot.docs[0].data()));
+      if (existingMarketsById.size > 0) {
+        const firstMarket = Array.from(existingMarketsById.values())[0];
+        console.warn('Sample market keys:', Object.keys(firstMarket));
       }
     }
     
@@ -500,7 +536,8 @@ export async function updateMarkets(): Promise<{
       const gammaMarket = marketsById.get(marketId);
       
       if (!gammaMarket) {
-        // Market not found in Gamma API - this is OK, just skip updating it
+        // Market not found in Gamma API - this is OK, it may have been closed/removed
+        // This is expected behavior, not an error
         skippedCount++;
         continue;
       }
