@@ -249,14 +249,10 @@ async function getExistingMarketIds(): Promise<Set<string>> {
     
     snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const data = doc.data() as MarketData;
-      // Prioritize marketId (Polymarket ID) over id (content-based ID)
-      if (data.marketId) {
-        marketIds.add(data.marketId);
-      } else if ((data as any).MarketId) {
-        // Handle case variations
-        marketIds.add(String((data as any).MarketId));
-      } else if ((data as any).gammaMarketId) {
-        marketIds.add((data as any).gammaMarketId);
+      // Prioritize MarketID (capital, from n8n import) then marketId (camelCase)
+      const marketId = (data as any).MarketID || data.marketId || (data as any).MarketId || (data as any).gammaMarketId;
+      if (marketId) {
+        marketIds.add(String(marketId));
       }
       // Note: We don't use data.id because it's content-based, not the Polymarket ID
     });
@@ -291,17 +287,17 @@ async function updateMarket(
     const firestore = getFirestore();
     const marketRef = firestore.collection('artifacts').doc(appId).collection('public').doc('data').collection('markets').doc(existingMarket.id);
     
-    // Map normalized fields back to MarketData format
+    // Map normalized fields back to MarketData format (with fallbacks for null values)
     const updateData: Partial<MarketData> = {
       probability: newProbability,
       lastUpdated: Date.now(),
-      // Update other fields if they changed
-      title: normalized.Question || existingMarket.title,
-      catalyst: normalized.Catalyst_Name || existingMarket.catalyst,
-      question: normalized.Question || existingMarket.question,
-      volume: normalized.Volume,
-      resolveDate: normalized.EndDate || existingMarket.resolveDate,
-      tags: normalized.Tags ? normalized.Tags.split('|').map(t => t.trim().toLowerCase()).filter(t => t.length > 0) : existingMarket.tags,
+      // Update other fields if they changed (with fallbacks)
+      title: normalized.Question || existingMarket.title || '',
+      catalyst: normalized.Catalyst_Name || existingMarket.catalyst || '',
+      question: normalized.Question || existingMarket.question || '',
+      volume: normalized.Volume !== undefined && normalized.Volume !== null ? normalized.Volume : (existingMarket.volume || 0),
+      resolveDate: normalized.EndDate || existingMarket.resolveDate || '',
+      tags: normalized.Tags ? normalized.Tags.split('|').map(t => t.trim().toLowerCase()).filter(t => t.length > 0) : (existingMarket.tags || []),
       // Track probability change for shock detection
       previousProbability: existingMarket.probability,
       changeDelta: newProbability - previousProbability
@@ -354,14 +350,14 @@ export async function updateMarkets(): Promise<{
     
     snapshot.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
       const data = doc.data() as MarketData;
-      // Use marketId (Polymarket ID) as primary key for matching
-      const marketId = data.marketId || (data as any).MarketId;
+      // Use MarketID (capital, from n8n) or marketId (camelCase) as primary key for matching
+      const marketId = (data as any).MarketID || data.marketId || (data as any).MarketId;
       if (marketId) {
         existingMarketsByMarketId.set(String(marketId), data);
       } else {
         // Log first market without marketId for debugging
         if (!(globalThis as any).__no_marketid_warned) {
-          console.warn(`Market ${data.id} has no marketId field. Keys:`, Object.keys(data));
+          console.warn(`Market ${data.id} has no MarketID/marketId field. Keys:`, Object.keys(data));
           (globalThis as any).__no_marketid_warned = true;
         }
       }
@@ -432,32 +428,43 @@ export async function updateMarkets(): Promise<{
           (globalThis as any).__market_structure_logged = true;
         }
         
-        // Try different field names for yesPrice (Gamma API might use different names)
-        const yesPrice = (gammaMarket.yesPrice !== undefined ? gammaMarket.yesPrice :
-                         (gammaMarket as any).yes_price !== undefined ? (gammaMarket as any).yes_price :
-                         (gammaMarket as any).yesPrice !== undefined ? (gammaMarket as any).yesPrice :
-                         (gammaMarket as any).price !== undefined ? (gammaMarket as any).price :
-                         (gammaMarket as any).lastPrice !== undefined ? (gammaMarket as any).lastPrice :
-                         (gammaMarket as any).outcomePrices?.[0] !== undefined ? (gammaMarket as any).outcomePrices[0] :
-                         undefined);
+        // Try different field names for price (Gamma API might use different names)
+        // Check common field names: lastTradePrice, bestBid, bestAsk, price, yesPrice, etc.
+        const priceValue = (gammaMarket as any).lastTradePrice !== undefined ? (gammaMarket as any).lastTradePrice :
+                          (gammaMarket as any).bestBid !== undefined ? (gammaMarket as any).bestBid :
+                          (gammaMarket as any).price !== undefined ? (gammaMarket as any).price :
+                          gammaMarket.yesPrice !== undefined ? gammaMarket.yesPrice :
+                          (gammaMarket as any).yes_price !== undefined ? (gammaMarket as any).yes_price :
+                          (gammaMarket as any).outcomePrices?.[0] !== undefined ? (gammaMarket as any).outcomePrices[0] :
+                          undefined;
         
         // Validate price
-        const yesPriceNum = yesPrice !== undefined ? Number(yesPrice) : NaN;
-        if (isNaN(yesPriceNum) || yesPriceNum < 0 || yesPriceNum > 1) {
-          console.warn(`Invalid yesPrice for market ${marketId}: ${yesPrice} (checked: yesPrice, yes_price, price, lastPrice, outcomePrices[0])`);
-          console.warn(`Market data keys:`, Object.keys(gammaMarket));
-          continue;
+        const priceNum = priceValue !== undefined ? Number(priceValue) : NaN;
+        if (isNaN(priceNum) || priceNum < 0 || priceNum > 1) {
+          // If price is invalid, try to use existing price from Firestore as fallback
+          const existingPrice = existingMarket.probability;
+          if (existingPrice !== undefined && !isNaN(existingPrice) && existingPrice >= 0 && existingPrice <= 1) {
+            console.warn(`Using existing price for market ${marketId} (Gamma API price invalid: ${priceValue})`);
+            // Continue with existing price
+          } else {
+            console.warn(`Invalid price for market ${marketId}: ${priceValue} (checked: lastTradePrice, bestBid, price, yesPrice, yes_price, outcomePrices[0])`);
+            console.warn(`Market data keys:`, Object.keys(gammaMarket));
+            continue;
+          }
         }
+        
+        // Use new price if valid, otherwise fallback to existing
+        const finalPrice = !isNaN(priceNum) && priceNum >= 0 && priceNum <= 1 ? priceNum : (existingMarket.probability || 0);
         
         // Create a normalized market from the Gamma market
         // We need event info - try to get it from the market or use defaults
         const normalized: NormalizedMarket = {
           marketId: marketId,
-          Catalyst_Name: (gammaMarket as any).event?.title || (gammaMarket as any).title || existingMarket.catalyst || 'Unknown Event',
-          Question: gammaMarket.question || existingMarket.question || '',
-          Price: yesPriceNum.toFixed(2),
-          Volume: gammaMarket.volume || existingMarket.volume || 0,
-          EndDate: gammaMarket.endDate || (gammaMarket as any).end_date || (gammaMarket as any).expirationDate || existingMarket.resolveDate || '',
+          Catalyst_Name: (gammaMarket as any).event?.title || (gammaMarket as any).title || existingMarket.catalyst || existingMarket.title || 'Unknown Event',
+          Question: gammaMarket.question || existingMarket.question || existingMarket.title || '',
+          Price: finalPrice.toFixed(2),
+          Volume: gammaMarket.volume || (gammaMarket as any).volumeUsd || existingMarket.volume || 0,
+          EndDate: gammaMarket.endDate || (gammaMarket as any).end_date || (gammaMarket as any).expirationDate || (gammaMarket as any).endDateTimestamp || existingMarket.resolveDate || '',
           Tags: (gammaMarket as any).event?.tags ? tagsToString((gammaMarket as any).event.tags) : 
                 (gammaMarket as any).tags ? tagsToString((gammaMarket as any).tags) :
                 (existingMarket.tags?.join('|') || '')

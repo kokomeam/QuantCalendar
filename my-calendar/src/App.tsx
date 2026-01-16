@@ -310,9 +310,10 @@ const normalizeMarketData = (item: Record<string, unknown>): Partial<MarketData>
     source: 'n8n'
   };
 
-  // Store MarketId for backend matching
+  // Store MarketID (capital, matching n8n format) for backend matching
   if (marketIdStr) {
-    (result as any).marketId = marketIdStr;
+    (result as any).MarketID = marketIdStr; // Store as MarketID (capital) to match n8n format
+    (result as any).marketId = marketIdStr; // Also store as marketId for backward compatibility
   }
 
   // Preserve prediction market fields if present
