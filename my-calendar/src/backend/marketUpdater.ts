@@ -8,9 +8,8 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { MarketData } from '../App.js';
-import { normalizeGammaEvent } from './normalize.js';
 import { detectShock, checkShockAlert, cleanupOldShocks } from './shockDetector.js';
-import type { GammaEvent } from './types.js';
+import type { GammaEvent, GammaMarket, NormalizedMarket } from './types.js';
 
 // Initialize Firebase Admin SDK with service account (lazy initialization)
 // Supports both file-based (local) and environment variable (deployed) service accounts
@@ -80,28 +79,94 @@ const appId = 'production-calendar';
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
 
 /**
- * Fetch markets from Gamma API
- * Since we only update existing markets, we need to fetch all active markets
- * and match them to existing Firestore markets
- * 
- * ASSUMPTION: Gamma API endpoint structure - will log raw response for verification
+ * Normalize tags array to pipe-delimited string (matching n8n logic)
  */
-async function fetchGammaMarkets(): Promise<GammaEvent[]> {
+function tagsToString(tags: Array<{ slug?: string; label?: string }> = []): string {
+  return tags
+    .map(t => t.slug || t.label)
+    .filter(Boolean)
+    .map(t => String(t).toLowerCase().replace(/\s+/g, '_'))
+    .join('|');
+}
+
+/**
+ * Fetch a single market by ID from Gamma API
+ * Tries /markets/{id} endpoint
+ */
+async function fetchMarketById(marketId: string): Promise<GammaMarket | null> {
   try {
-    // According to Gamma API docs, we may need to fetch all markets or use a search endpoint
-    // This is a placeholder - adjust based on actual API spec
-    // Common patterns: /markets, /markets/active, /events
-    const url = `${GAMMA_API_BASE}/markets`;
-    
+    const url = `${GAMMA_API_BASE}/markets/${marketId}`;
     const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json'
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        return null; // Market not found
       }
+      console.warn(`Gamma API error for market ${marketId}: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    return data as GammaMarket;
+  } catch (error) {
+    console.error(`Error fetching market ${marketId}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Fetch markets from Gamma API
+ * First tries to fetch all markets, then falls back to fetching by ID if needed
+ */
+async function fetchGammaMarkets(marketIds?: Set<string>): Promise<GammaMarket[]> {
+  const markets: GammaMarket[] = [];
+  
+  // If we have specific market IDs, try fetching them individually
+  if (marketIds && marketIds.size > 0) {
+    console.log(`Attempting to fetch ${marketIds.size} markets by ID from Gamma API...`);
+    const idsArray = Array.from(marketIds);
+    
+    // Fetch markets in batches to avoid rate limiting
+    const batchSize = 10;
+    for (let i = 0; i < idsArray.length; i += batchSize) {
+      const batch = idsArray.slice(i, i + batchSize);
+      const promises = batch.map(id => fetchMarketById(id));
+      const results = await Promise.all(promises);
+      
+      results.forEach((market, idx) => {
+        if (market) {
+          markets.push(market);
+        } else {
+          console.warn(`Market ${batch[idx]} not found in Gamma API`);
+        }
+      });
+      
+      // Small delay between batches
+      if (i + batchSize < idsArray.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    if (markets.length > 0) {
+      console.log(`Successfully fetched ${markets.length} markets by ID`);
+      return markets;
+    }
+    
+    console.log('No markets found by ID, falling back to bulk fetch...');
+  }
+  
+  // Fallback: fetch all markets from /markets endpoint
+  try {
+    const url = `${GAMMA_API_BASE}/markets`;
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
     });
 
     if (!response.ok) {
       console.warn(`Gamma API error: ${response.status} ${response.statusText}`);
-      return [];
+      return markets;
     }
 
     const data = await response.json();
@@ -113,6 +178,7 @@ async function fetchGammaMarkets(): Promise<GammaEvent[]> {
       if (Array.isArray(data) && data.length > 0) {
         console.log('Array length:', data.length);
         console.log('First item keys:', Object.keys(data[0]));
+        console.log('First item sample:', JSON.stringify(data[0], null, 2).substring(0, 500));
       } else if (typeof data === 'object' && data !== null) {
         console.log('Response keys:', Object.keys(data));
       }
@@ -121,18 +187,35 @@ async function fetchGammaMarkets(): Promise<GammaEvent[]> {
     
     // Handle different response formats
     if (Array.isArray(data)) {
-      return data as GammaEvent[];
+      // If it's an array of markets, return directly
+      if (data.length > 0 && data[0].question) {
+        return data as GammaMarket[];
+      }
+      // If it's an array of events, extract markets
+      const events = data as GammaEvent[];
+      events.forEach(event => {
+        if (event.markets && Array.isArray(event.markets)) {
+          markets.push(...event.markets);
+        }
+      });
+      return markets;
     } else if (data.events && Array.isArray(data.events)) {
-      return data.events as GammaEvent[];
+      const events = data.events as GammaEvent[];
+      events.forEach(event => {
+        if (event.markets && Array.isArray(event.markets)) {
+          markets.push(...event.markets);
+        }
+      });
+      return markets;
     } else if (data.markets && Array.isArray(data.markets)) {
-      return data.markets as GammaEvent[];
+      return data.markets as GammaMarket[];
     } else {
       console.warn('Unexpected Gamma API response format');
-      return [];
+      return markets;
     }
   } catch (error) {
     console.error('Error fetching Gamma markets:', error);
-    return [];
+    return markets;
   }
 }
 
@@ -259,57 +342,83 @@ export async function updateMarkets(): Promise<{
     
     console.log(`Processing ${existingMarkets.size} markets...`);
     
-    // Fetch all markets from Gamma API
+    // Fetch markets from Gamma API - try by ID first, then fallback to bulk
     console.log('Fetching markets from Gamma API...');
-    const gammaEvents = await fetchGammaMarkets();
+    const gammaMarkets = await fetchGammaMarkets(existingMarketIds);
     
-    if (gammaEvents.length === 0) {
+    if (gammaMarkets.length === 0) {
       console.log('No markets returned from Gamma API');
       return result;
     }
     
-    console.log(`Fetched ${gammaEvents.length} events from Gamma API`);
+    console.log(`Fetched ${gammaMarkets.length} markets from Gamma API`);
     
-    // Process Gamma events and match to existing markets by ID
-    for (const gammaEvent of gammaEvents) {
+    // Log matching info
+    const marketIdsInResponse = new Set(gammaMarkets.map(m => m.id).filter(Boolean) as string[]);
+    const matchingIds = Array.from(existingMarketIds).filter(id => marketIdsInResponse.has(id));
+    console.log(`Unique market IDs in Gamma response: ${marketIdsInResponse.size}`);
+    console.log(`Markets in Firestore that match Gamma response: ${matchingIds.length}`);
+    
+    if (matchingIds.length === 0) {
+      console.warn('⚠️ No matching market IDs found! This suggests ID format mismatch.');
+      console.warn('Sample Firestore IDs:', Array.from(existingMarketIds).slice(0, 5));
+      console.warn('Sample Gamma API IDs:', Array.from(marketIdsInResponse).slice(0, 5));
+    }
+    
+    // Group markets by event (if they have event info) or process individually
+    // Create a map of markets by ID for quick lookup
+    const marketsById = new Map<string, GammaMarket>();
+    gammaMarkets.forEach(market => {
+      if (market.id) {
+        marketsById.set(market.id, market);
+      }
+    });
+    
+    // Process each existing market
+    for (const [marketId, existingMarket] of existingMarkets.entries()) {
+      const gammaMarket = marketsById.get(marketId);
+      
+      if (!gammaMarket) {
+        continue; // Market not found in Gamma API response
+      }
+      
       try {
-        // Normalize event - this already filters by existingMarketIds
-        const normalizedMarkets = normalizeGammaEvent(gammaEvent, existingMarketIds);
+        // Create a normalized market from the Gamma market
+        // We need event info - try to get it from the market or use defaults
+        const normalized: NormalizedMarket = {
+          marketId: marketId,
+          Catalyst_Name: (gammaMarket as any).event?.title || existingMarket.catalyst || 'Unknown Event',
+          Question: gammaMarket.question || existingMarket.question || '',
+          Price: (Number(gammaMarket.yesPrice) || 0).toFixed(2),
+          Volume: gammaMarket.volume || existingMarket.volume || 0,
+          EndDate: gammaMarket.endDate || existingMarket.resolveDate || '',
+          Tags: (gammaMarket as any).event?.tags ? tagsToString((gammaMarket as any).event.tags) : (existingMarket.tags?.join('|') || '')
+        };
         
-        if (normalizedMarkets.length === 0) {
-          continue; // Event filtered out
+        // Validate price
+        const yesPrice = Number(gammaMarket.yesPrice);
+        if (isNaN(yesPrice) || yesPrice < 0 || yesPrice > 1) {
+          console.warn(`Invalid yesPrice for market ${marketId}: ${gammaMarket.yesPrice}`);
+          continue;
         }
         
-        // Process each normalized market - match by ID
-        for (const normalizedMarket of normalizedMarkets) {
-          // Match by market ID (already filtered by normalizeGammaEvent)
-          const existingMarket = existingMarkets.get(normalizedMarket.marketId);
-          
-          if (!existingMarket) {
-            continue; // Market not found (shouldn't happen, but skip if it does)
-          }
-          
-          // Update market
-          const updated = await updateMarket(existingMarket.id, normalizedMarket, existingMarket);
-          
-          if (updated) {
-            result.updated++;
-            
-            // Check for shock
-            const newProb = parseFloat(normalizedMarket.Price);
-            const oldProb = existingMarket.probability || 0;
-            if (Math.abs(newProb - oldProb) >= 0.05) {
-              result.shocks++;
-            }
-          } else {
-            result.errors++;
-          }
-        }
+        // Update market
+        const updated = await updateMarket(existingMarket.id, normalized, existingMarket);
         
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 50));
+        if (updated) {
+          result.updated++;
+          
+          // Check for shock
+          const newProb = parseFloat(normalized.Price);
+          const oldProb = existingMarket.probability || 0;
+          if (Math.abs(newProb - oldProb) >= 0.05) {
+            result.shocks++;
+          }
+        } else {
+          result.errors++;
+        }
       } catch (error) {
-        console.error(`Error processing Gamma event:`, error);
+        console.error(`Error processing market ${marketId}:`, error);
         result.errors++;
       }
     }
