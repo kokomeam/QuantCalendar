@@ -287,23 +287,22 @@ async function updateMarket(
     const firestore = getFirestore();
     const marketRef = firestore.collection('artifacts').doc(appId).collection('public').doc('data').collection('markets').doc(existingMarket.id);
     
-    // Map normalized fields back to MarketData format (with fallbacks for null values)
+    // ONLY update probability and tracking fields - preserve all other fields
+    // Do NOT overwrite title, question, catalyst, etc. - only update probability
     const updateData: Partial<MarketData> = {
       probability: newProbability,
       lastUpdated: Date.now(),
-      // Update other fields if they changed (with fallbacks)
-      title: normalized.Question || existingMarket.title || '',
-      catalyst: normalized.Catalyst_Name || existingMarket.catalyst || '',
-      question: normalized.Question || existingMarket.question || '',
-      volume: normalized.Volume !== undefined && normalized.Volume !== null ? normalized.Volume : (existingMarket.volume || 0),
-      resolveDate: normalized.EndDate || existingMarket.resolveDate || '',
-      tags: normalized.Tags ? normalized.Tags.split('|').map(t => t.trim().toLowerCase()).filter(t => t.length > 0) : (existingMarket.tags || []),
       // Track probability change for shock detection
       previousProbability: existingMarket.probability,
       changeDelta: newProbability - previousProbability
+      // NOTE: We intentionally do NOT update title, question, catalyst, volume, resolveDate, tags
+      // These should remain as they were imported from n8n
+      // Only probability should be updated from Gamma API
     };
     
-    await marketRef.set({ ...existingMarket, ...updateData }, { merge: true });
+    // Use update() instead of set() to only modify specified fields
+    // This ensures we don't accidentally delete or overwrite other fields
+    await marketRef.update(updateData);
     
     return true;
   } catch (error) {
@@ -405,18 +404,36 @@ export async function updateMarkets(): Promise<{
     });
     
     // Process each existing market by marketId (Polymarket ID)
+    // CRITICAL: Only process markets that exist in Firestore - never create new ones
+    let processedCount = 0;
+    let skippedCount = 0;
+    
     for (const marketId of existingMarketIds) {
       const existingMarket = existingMarketsByMarketId.get(marketId);
-      const gammaMarket = marketsById.get(marketId);
       
       if (!existingMarket) {
-        console.warn(`Market with marketId ${marketId} not found in existingMarkets map`);
+        // This shouldn't happen, but skip if market not in our map
+        console.warn(`Market with marketId ${marketId} not found in existingMarkets map - skipping`);
+        skippedCount++;
         continue;
       }
       
-      if (!gammaMarket) {
-        continue; // Market not found in Gamma API response
+      // Verify this market exists in Firestore by checking it has an id
+      if (!existingMarket.id) {
+        console.warn(`Market with marketId ${marketId} has no document id - skipping`);
+        skippedCount++;
+        continue;
       }
+      
+      const gammaMarket = marketsById.get(marketId);
+      
+      if (!gammaMarket) {
+        // Market not found in Gamma API - this is OK, just skip updating it
+        skippedCount++;
+        continue;
+      }
+      
+      processedCount++;
       
       try {
         // Log market structure for first few markets to debug
@@ -503,6 +520,7 @@ export async function updateMarkets(): Promise<{
     }
     
     console.log(`Market update complete: ${result.updated} updated, ${result.errors} errors, ${result.shocks} shocks`);
+    console.log(`Processed ${processedCount} markets, skipped ${skippedCount} (not in Gamma API or missing data)`);
     
     return result;
   } catch (error) {
